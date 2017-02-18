@@ -53,13 +53,78 @@ BOOST_AUTO_TEST_CASE(ImageAndTextReaderSimple)
         1);
 }
 
+BOOST_AUTO_TEST_CASE(ImageSimpleCompositeAndBase64)
+{
+    auto test = [this](std::vector<std::wstring> additionalParameters)
+    {
+        HelperRunReaderTest<float>(
+            testDataPath() + "/Config/ImageReaderSimple_Config.cntk",
+            testDataPath() + "/Control/ImageSimpleCompositeAndBase64_Control.txt",
+            testDataPath() + "/Control/ImageSimpleCompositeAndBase64_Output.txt",
+            "Composite_Test",
+            "reader",
+            4,
+            4,
+            1,
+            1,
+            1,
+            0,
+            1,
+            false,
+            false,
+            true,
+            additionalParameters);
+    };
+
+    // Image deserializer.
+    test({});
+    // Base64 deserializer.
+    test(
+    {
+        L"MapFile=\"$RootDir$/Base64ImageReaderSimple_map.txt\"",
+        L"DeserializerType=\"Base64ImageDeserializer\""
+    });
+};
+
+BOOST_AUTO_TEST_CASE(InvalidImageSimpleCompositeAndBase64)
+{
+    auto test = [this](std::vector<std::wstring> additionalParameters)
+    {
+        HelperRunReaderTest<float>(
+            testDataPath() + "/Config/ImageReaderSimple_Config.cntk",
+            testDataPath() + "/Control/InvalidImageSimpleCompositeAndBase64_Control.txt",
+            testDataPath() + "/Control/InvalidImageSimpleCompositeAndBase64_Output.txt",
+            "Composite_Test",
+            "reader",
+            4,
+            4,
+            1,
+            1,
+            1,
+            0,
+            1,
+            false,
+            false,
+            true,
+            additionalParameters);
+    };
+
+    test(
+    {
+        L"MapFile=\"$RootDir$/InvalidBase64ImageReaderSimple_map.txt\"",
+        L"DeserializerType=\"Base64ImageDeserializer\""
+        L"maxErrors=4"
+    });
+};
+
+
 BOOST_AUTO_TEST_CASE(ImageAndImageReaderSimple)
 {
     HelperRunReaderTest<float>(
-        testDataPath() + "/Config/ImageAndImageReaderSimple_Config.cntk",
+        testDataPath() + "/Config/ImageDeserializers.cntk",
         testDataPath() + "/Control/ImageAndImageReaderSimple_Control.txt",
         testDataPath() + "/Control/ImageAndImageReaderSimple_Output.txt",
-        "Simple_Test",
+        "ImageAndImageReaderSimple_Test",
         "reader",
         4,
         4,
@@ -67,7 +132,11 @@ BOOST_AUTO_TEST_CASE(ImageAndImageReaderSimple)
         2,
         2,
         0,
-        1);
+        1,
+        false,
+        false,
+        true,
+        { L"MapFile=\"$RootDir$/ImageReaderSimple_map.txt\"" });
 }
 
 BOOST_AUTO_TEST_CASE(ImageReaderBadMap)
@@ -146,6 +215,28 @@ BOOST_AUTO_TEST_CASE(ImageReaderZip)
         0,
         1);
 }
+
+BOOST_AUTO_TEST_CASE(ImageReaderZipDuplicate)
+{
+    HelperRunReaderTest<float>(
+        testDataPath() + "/Config/ImageDeserializers.cntk",
+        testDataPath() + "/Control/ImageReaderZipDuplicate_Control.txt",
+        testDataPath() + "/Control/ImageReaderZipDuplicate_Output.txt",
+        "SimpleZip",
+        "reader",
+        4,
+        4,
+        1,
+        1,
+        0,
+        0,
+        1,
+        false,
+        false,
+        true,
+        { L"MapFile=\"$RootDir$/ImageReaderZipDuplicate_map.txt\"" });
+}
+
 
 BOOST_AUTO_TEST_CASE(ImageReaderZipMissingFile)
 {
@@ -264,8 +355,8 @@ BOOST_AUTO_TEST_CASE(ImageReaderEmptyTransforms)
         testDataPath() + "/Control/ImageTransforms_Output.txt",
         "SameShapeEmptyTransforms_Test",
         "reader",
-        1,
         2,
+        1,
         1,
         1,
         0,
@@ -324,4 +415,41 @@ BOOST_AUTO_TEST_CASE(ImageReaderMissingScaleTransforms)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
-} } } }
+
+namespace
+{
+    // Test with not set data directory.
+    struct EmptyDataDirFixture : ReaderFixture
+    {
+        EmptyDataDirFixture() : ReaderFixture("/.") { }
+    };
+
+    BOOST_FIXTURE_TEST_SUITE(ReaderTestSuite, EmptyDataDirFixture)
+
+    BOOST_AUTO_TEST_CASE(ImageReader3DotsSyntaxInMapFile)
+    {
+        auto testDir = testDataPath();
+        std::wstring mapFileLocaton = std::wstring(testDir.begin(), testDir.end()) + L"/Data/ImageReader3Dots_map.txt";
+        HelperRunReaderTest<float>(
+            testDataPath() + "/Config/ImageDeserializers.cntk",
+            testDataPath() + "/Control/ImageReader3DotsSyntaxInMapFile_Control.txt",
+            testDataPath() + "/Control/ImageReader3DotsSyntaxInMapFile_Output.txt",
+            "3DotsExpansionTest",
+            "reader",
+            1,
+            2,
+            1,
+            1,
+            1,
+            0,
+            1,
+            false,
+            true,
+            true,
+            { L"MapFile=\"" + mapFileLocaton + L"\"" });
+    }
+
+    BOOST_AUTO_TEST_SUITE_END()
+}
+
+}}}}

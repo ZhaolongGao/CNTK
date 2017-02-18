@@ -23,7 +23,6 @@
 #include "NDLNetworkBuilder.h"
 #include "ModelEditLanguage.h"
 #include "CPUMatrix.h" // used for SetNumThreads()
-#include "GPUMatrix.h" // used for SyncGuard::EnableSync()
 #include "CommonMatrix.h"
 #include "SGD.h"
 #include "MPIWrapper.h"
@@ -36,6 +35,8 @@
 #include "ScriptableObjects.h"
 #include "BrainScriptEvaluator.h"
 #include "BrainScriptParser.h"
+#include "PerformanceProfiler.h"
+#include "CNTKLibrary.h"
 
 #include <string>
 #include <chrono>
@@ -61,11 +62,6 @@
 #define let const auto
 #endif
 
-// TODO: Temporary mechanism to enable memory sharing for
-// node output value matrices. This will go away when the
-// sharing is ready to be enabled by default
-bool g_shareNodeValueMatrices = false;
-
 using namespace std;
 using namespace Microsoft::MSR;
 using namespace Microsoft::MSR::CNTK;
@@ -73,6 +69,20 @@ using namespace Microsoft::MSR::CNTK;
 // internal test routine forward declaration
 template <typename ElemType>
 void TestCn(const ConfigParameters& config);
+
+// Setup profiling
+template <typename ConfigParamType>
+void SetupProfiling(ProfilerContext& profilerContext, const ConfigParamType& config, int nodeRank)
+{
+    if (config(L"profilerEnabled", false))
+    {
+        wstring workDir = config(L"WorkDir", L".");
+        profilerContext.Init(workDir + L"/profiler",
+                             config(L"profilerBufferSize", static_cast<uint64_t>(32 * 1024 * 1024)),
+                             std::to_wstring(nodeRank),
+                             config(L"profilerSyncGpu", true));
+    }
+}
 
 void RedirectStdErr(wstring logpath)
 {
@@ -108,7 +118,7 @@ size_t GetMaxEpochs(const ConfigParameters& configParams)
 // TODO: Clarify how a single thread restriction can be lifted.
 void ForceDeterministicAlgorithmsOnCPU()
 {
-    LOGPRINTF(stderr, "WARNING: forceDeterministcAlgorithms flag is specified. Using 1 CPU thread for processing.\n");
+    LOGPRINTF(stderr, "WARNING: forceDeterministicAlgorithms flag is specified. Using 1 CPU thread for processing.\n");
     CPUMatrix<float /*any type will do*/>::SetNumThreads(1);
     CPUMatrix<float /*any type will do*/>::SetCompatibleMode();
 }
@@ -243,6 +253,9 @@ void DoCommands(const ConfigParameters& config, const shared_ptr<MPIWrapper>& mp
             ProgressTracing::SetStepOffset(fullEpochsOffset); // this is the epoch number that SGD will log relative to
         }
 
+        if (Globals::ShouldEnableHyperCompressMemory())
+            Matrix<ElemType>::UseCachedResizeOrNot(true);
+
         // determine the action to perform, and do it
         for (int j = 0; j < action.size(); j++)
         {
@@ -338,7 +351,7 @@ void DoCommands(const ConfigParameters& config, const shared_ptr<MPIWrapper>& mp
             fprintf(stderr, "\n");
             if (traceLevel > 0)
             {
-                LOGPRINTF(stderr, "Action \"%s\" complete.\n\n", thisAction.c_str());
+            LOGPRINTF(stderr, "Action \"%s\" complete.\n\n", thisAction.c_str());
             }
 
             NDLScript<ElemType> ndlScript;
@@ -358,46 +371,6 @@ std::string TimeDateStamp()
     char buf[30];
     sprintf(buf, "%04d/%02d/%02d %02d:%02d:%02d", now.tm_year + 1900, now.tm_mon + 1, now.tm_mday, now.tm_hour, now.tm_min, now.tm_sec);
     return buf;
-}
-
-void PrintBuiltInfo()
-{
-    LOGPRINTF(stderr, "-------------------------------------------------------------------\n");
-    LOGPRINTF(stderr, "Build info: \n\n");
-    LOGPRINTF(stderr, "\t\tBuilt time: %s %s\n", __DATE__, __TIME__);
-    LOGPRINTF(stderr, "\t\tLast modified date: %s\n", __TIMESTAMP__);
-#ifdef _BUILDTYPE_
-    LOGPRINTF(stderr, "\t\tBuild type: %s\n", _BUILDTYPE_);
-#endif
-#ifdef _BUILDTARGET_
-    LOGPRINTF(stderr, "\t\tBuild target: %s\n", _BUILDTARGET_);
-#endif
-#ifdef _WITH_1BITSGD_
-    LOGPRINTF(stderr, "\t\tWith 1bit-SGD: %s\n", _WITH_1BITSGD_);
-#endif
-#ifdef _MATHLIB_
-    LOGPRINTF(stderr, "\t\tMath lib: %s\n", _MATHLIB_);
-#endif
-#ifdef _CUDA_PATH_
-    LOGPRINTF(stderr, "\t\tCUDA_PATH: %s\n", _CUDA_PATH_);
-#endif
-#ifdef _CUB_PATH_
-    LOGPRINTF(stderr, "\t\tCUB_PATH: %s\n", _CUB_PATH_);
-#endif
-#ifdef _CUDNN_PATH_
-    LOGPRINTF(stderr, "\t\tCUDNN_PATH: %s\n", _CUDNN_PATH_);
-#endif
-#ifdef _GIT_EXIST
-    LOGPRINTF(stderr, "\t\tBuild Branch: %s\n", _BUILDBRANCH_);
-    LOGPRINTF(stderr, "\t\tBuild SHA1: %s\n", _BUILDSHA1_);
-#endif
-#ifdef _BUILDER_
-    LOGPRINTF(stderr, "\t\tBuilt by %s on %s\n", _BUILDER_, _BUILDMACHINE_);
-#endif
-#ifdef _BUILDPATH_
-    LOGPRINTF(stderr, "\t\tBuild Path: %s\n", _BUILDPATH_);
-#endif
-    LOGPRINTF(stderr, "-------------------------------------------------------------------\n");
 }
 
 void PrintUsageInfo()
@@ -427,7 +400,7 @@ void PrintGpuInfo()
     for (GpuData& data : gpusData)
     {
         LOGPRINTF(stderr, "\t\tDevice[%d]: cores = %d; computeCapability = %d.%d; type = \"%s\"; memory = %lu MB\n",
-                  data.deviceId, data.cudaCores, data.versionMajor, data.versionMinor, data.name.c_str(), data.totalMemory);
+                  data.deviceId, data.cudaCores, data.versionMajor, data.versionMinor, data.name.c_str(), (unsigned long)data.totalMemory);
     }
     LOGPRINTF(stderr, "-------------------------------------------------------------------\n");
 #endif
@@ -462,6 +435,8 @@ static wstring PathToBSStringLiteral(const wstring& path) // quote a pathname fo
         return L'"' + path + L'"';
 }
 
+// TODO: There is a lot of duplication between this function and the NDL version.
+// The code here should be properly refactored to enable sharing.
 int wmainWithBS(int argc, wchar_t* argv[]) // called from wmain which is a wrapper that catches & reports Win32 exceptions
 {
     vector<wstring> args(argv, argv + argc);
@@ -527,12 +502,12 @@ int wmainWithBS(int argc, wchar_t* argv[]) // called from wmain which is a wrapp
     auto valpp = config.Find(L"deviceId");
     if (valpp)
     {
-        auto valp = *valpp;
-        if (!valp.Is<ScriptableObjects::String>()) // if it's not string 'auto' or 'cpu', then it's a gpu
+        auto valp2 = *valpp;
+        if (!valp2.Is<ScriptableObjects::String>()) // if it's not string 'auto' or 'cpu', then it's a gpu
         {
-            if (static_cast<int>(valp) >= 0) // gpu (id >= 0)
+            if (static_cast<int>(valp2) >= 0) // gpu (id >= 0)
             {
-                CheckSupportForGpu(valp); // throws if gpu is not supported
+                CheckSupportForGpu(valp2); // throws if gpu is not supported
             }
         }
     }
@@ -560,13 +535,11 @@ int wmainWithBS(int argc, wchar_t* argv[]) // called from wmain which is a wrapp
         mpi = MPIWrapper::GetInstance(true /*create*/);
     }  
 
-    g_shareNodeValueMatrices = config(L"shareNodeValueMatrices", false);
+    Globals::SetShareNodeValueMatrices(config(L"shareNodeValueMatrices", true));
+    Globals::SetGradientAccumulationOptimization(config(L"optimizeGradientAccumulation", true));
+    Globals::SetHyperCompressMemory(config(L"hyperCompressMemory", false));
 
     TracingGPUMemoryAllocator::SetTraceLevel(config(L"traceGPUMemoryAllocations", 0));
-
-    bool synchronizeCUDAKernelExecutions = config(L"synchronizeCUDAKernelExecutions", false);
-    if (synchronizeCUDAKernelExecutions)
-        SyncGuard::EnableSync();
 
     // logging
     wstring logpath = config(L"stderr", L"");
@@ -577,11 +550,15 @@ int wmainWithBS(int argc, wchar_t* argv[]) // called from wmain which is a wrapp
 
         RedirectStdErr(logpath);
         LOGPRINTF(stderr, "%ls\n", startupMessage.c_str());
-        PrintBuiltInfo();
+        ::CNTK::PrintBuiltInfo();
     }
 
     // echo gpu info to log
     PrintGpuInfo();
+
+    // Setup profiling
+    ProfilerContext profilerContext;
+    SetupProfiling(profilerContext, config, paralleltrain ? (int)mpi->CurrentNodeRank() : 0);
 
     // execute the actions
     // std::string type = config(L"precision", "float");
@@ -641,7 +618,7 @@ int wmainWithBS(int argc, wchar_t* argv[]) // called from wmain which is a wrapp
 
 static void PrintBanner(int argc, wchar_t* argv[], const string& timestamp)
 {
-    fprintf(stderr, "CNTK 2.0.beta1.0 (");
+    fprintf(stderr, "CNTK 2.0.beta11.0 (");
 #ifdef _GIT_EXIST
     fprintf(stderr, "%s %.6s, ", _BUILDBRANCH_, _BUILDSHA1_);
 #endif
@@ -702,7 +679,9 @@ int wmainOldCNTKConfig(int argc, wchar_t* argv[])
        mpi = MPIWrapper::GetInstance(true /*create*/);
     } 
 
-    g_shareNodeValueMatrices = config(L"shareNodeValueMatrices", false);
+    Globals::SetShareNodeValueMatrices(config(L"shareNodeValueMatrices", true));
+    Globals::SetGradientAccumulationOptimization(config(L"optimizeGradientAccumulation", true));
+    Globals::SetHyperCompressMemory(config(L"hyperCompressMemory", false));
 
     TracingGPUMemoryAllocator::SetTraceLevel(config(L"traceGPUMemoryAllocations", 0));
 
@@ -714,9 +693,9 @@ int wmainOldCNTKConfig(int argc, wchar_t* argv[])
         {
             for (int i = 0; i < command.size(); i++) // append all 'command' entries
             {
-                logpath += L"_";
+            logpath += L"_";
                 logpath += (wstring)command[i];
-            }
+        }
             logpath += L".log"; // append .log
         }
 
@@ -737,22 +716,19 @@ int wmainOldCNTKConfig(int argc, wchar_t* argv[])
     }
 
     // full config info
-    if (traceLevel > 0)
-    {
-        PrintBuiltInfo();
-        PrintGpuInfo();
-    }
+    ::CNTK::PrintBuiltInfo();
+    PrintGpuInfo();
 
 #ifdef _DEBUG
     if (traceLevel > 0)
     {
-        // This simply merges all the different config parameters specified (eg, via config files or via command line directly),
-        // and prints it.
+    // This simply merges all the different config parameters specified (eg, via config files or via command line directly),
+    // and prints it.
         fprintf(stderr, "\nConfiguration, Raw:\n\n");
         LOGPRINTF(stderr, "%s\n", rawConfigString.c_str());
 
-        // Same as above, but all variables are resolved.  If a parameter is set multiple times (eg, set in config, overridden at command line),
-        // All of these assignments will appear, even though only the last assignment matters.
+    // Same as above, but all variables are resolved.  If a parameter is set multiple times (eg, set in config, overridden at command line),
+    // All of these assignments will appear, even though only the last assignment matters.
         fprintf(stderr, "\nConfiguration After Variable Resolution:\n\n");
         LOGPRINTF(stderr, "%s\n", config.ResolveVariables(rawConfigString).c_str());
     }
@@ -772,6 +748,10 @@ int wmainOldCNTKConfig(int argc, wchar_t* argv[])
             fprintf(stderr, " %s", command[i].c_str());
         fprintf(stderr, "\n");
     }
+
+    // Setup profiling
+    ProfilerContext profilerContext;
+    SetupProfiling(profilerContext, config, paralleltrain ? (int)mpi->CurrentNodeRank() : 0);
 
     // run commands
     std::string type = config(L"precision", "float");
@@ -829,9 +809,10 @@ int wmain1(int argc, wchar_t* argv[]) // called from wmain which is a wrapper th
     {        
         if (argc <= 1)
         {
-            PrintBuiltInfo(); // print build info directly in case that user provides zero argument (convenient for checking build type)
+            ::CNTK::PrintBuiltInfo(); // print build info directly in case that user provides zero argument (convenient for checking build type)
             LOGPRINTF(stderr, "No command-line argument given.\n");
             PrintUsageInfo();
+            fflush(stderr);
             return EXIT_FAILURE;
         }
 
@@ -850,27 +831,26 @@ int wmain1(int argc, wchar_t* argv[]) // called from wmain which is a wrapper th
     {
         fprintf(stderr, "\n");
         err.PrintError(ProgressTracing::GetTimeStampPrefix() + L"EXCEPTION occurred.");
-        return EXIT_FAILURE;
     }
     catch (const IExceptionWithCallStackBase& err)
     {
         fprintf(stderr, "\n");
         fprintf(stderr, "%s", err.CallStack());
         LOGPRINTF(stderr, "EXCEPTION occurred: %s\n", dynamic_cast<const std::exception&>(err).what());
-        return EXIT_FAILURE;
     }
     catch (const std::exception& err)
     {
         fprintf(stderr, "\n");
         LOGPRINTF(stderr, "EXCEPTION occurred: %s\n", err.what());
-        return EXIT_FAILURE;
     }
     catch (...)
     {
         fprintf(stderr, "\n");
         LOGPRINTF(stderr, "Unknown ERROR occurred.\n");
-        return EXIT_FAILURE;
     }
+
+    fflush(stderr);
+    return EXIT_FAILURE;
 }
 
 #ifdef __WINDOWS__

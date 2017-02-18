@@ -1,31 +1,36 @@
 from cntk import cntk_py
-from ..utils import typemap, sanitize_var_map, value_to_seq
+from cntk.device import DeviceDescriptor
+from cntk.utils import typemap, sanitize_var_map, sanitize_batch, variable_value_to_seq
+
+from cntk.utils.swig_helper import map_if_possible
+from cntk.ops.variables import Variable
 from enum import Enum, unique
+import numpy as np
+
 
 @unique
 class CloneMethod(Enum):
     '''
-    Describes different ways how :class:`cntk.ops.functions.Function.forward`
+    Describes different ways how :func:`~cntk.ops.functions.Function.clone`
     works.
     '''
 
-    clone = 1
-    '''
-    New learnable Parameters are created and initialied with the current values of the
-    corresponding Parameters of the Function being cloned
-    '''
-
-    share = 2
+    share = 'share'
     '''
     Parameters are shared between the Function being cloned and the new clone
     '''
 
-    freeze = 3
+    clone = 'clone'
+    '''
+    New learnable parameters are created and initialized with the current values of the
+    corresponding parameters of the Function being cloned
+    '''
+
+    freeze = 'freeze'
     '''
     Parameters are cloned and made immutable; i.e. Constants in the new clone
     (e.g. for use as a fixed feature extractor)
     '''
-
 
 class Function(cntk_py.Function):
     '''
@@ -34,7 +39,6 @@ class Function(cntk_py.Function):
     If it has only one output, one can invoke Variable methods on it, which it
     will relay to its only output.
     '''
-
 
     # define input shapes, in-place
     # e.g.
@@ -90,14 +94,26 @@ class Function(cntk_py.Function):
         return self(other)
 
     def __getattr__(self, name):
-        try:
-            return self.__dict__[name]
-        except KeyError:
-            if len(self.outputs) == 1:
-                return getattr(self.output, name)
+        # If something is not found in Function, look it up in its output
+        # variable, if it has only one.
+        if not hasattr(Variable, name) or name.startswith('_') or \
+                name in ['outputs', 'output', 'this']:
+            # These should not be looked up in self's output.
+            # 'outputs' and 'output' are required to fetch the attribute for
+            # in the Variable.
+            # 'this' is required for Swig and needs to be thrown if the
+            # object is created the first time.
+            raise AttributeError("neither Function nor its output variable"
+                    " has '%s'"%name)
 
-        raise AttributeError("'%s' object has no attribute '%s'" %
-                             (type(self), name))
+        outputs = self.__getattribute__('outputs')
+        if len(outputs) != 1:
+            raise AttributeError("Function does not have '%s' and it cannot "
+                    "be looked up in its outputs because it does not have "
+                    "exactly one"%name)
+
+        return getattr(outputs[0], name)
+
 
     @property
     @typemap
@@ -116,44 +132,48 @@ class Function(cntk_py.Function):
         return super(Function, self).attributes()
 
     @typemap
-    def clone(self, method=CloneMethod.freeze, substitutions=None):
+    def clone(self, method, substitutions=None):
         '''
         Clones the function. The parameters of the Function are either cloned,
         shared or frozen as specified by the method argument and any variable
         substitutions requested are applied in the cloned Function instance.
 
         Args:
-            method (:class:`cntk.ops.functions.CloneMethod`): one of
+            method (:class:`CloneMethod`): one of
 
              * 'clone': the returned function gets its own copy of parameters (default)
              * 'share': the returned function shares its parameters with this function
              * 'freeze': parameters are cloned and made immutable (constant).
 
-            substitutions (`dict`): a dictionary mapping variables in this
+            substitutions (dict): a dictionary mapping variables in this
              function to variables in the cloned function
 
         Returns:
-            :class:`Function`: the cloned Function
+            :class:`~cntk.ops.functions.Function`: the cloned Function
         '''
-        if not isinstance(method, CloneMethod):
-            raise ValueError('clone method "%s" is not supported' %
-                    str(method))
+        # C++ clone() can only clone composites. If we are not a composite, make it one using combine()
+        if not self.is_composite:
+            from cntk import combine
+            #return combine([self]).clone(method, substitutions).root_function.arguments[0].owner
+            # BUGBUG: This ^^ does not give me the correct .arguments, so we leave the extra combine() in for now.
+            return combine([self]).clone(method, substitutions)
 
         method = getattr(cntk_py,
-                'ParameterCloningMethod_' + method.name.capitalize())
-        if substitutions is None:
-            substitutions = {}
+                'ParameterCloningMethod_' + CloneMethod(method).name.capitalize())
+        substitutions = substitutions or {}
+        if not isinstance(substitutions, dict):
+            raise TypeError("Variable substitution map must be a dictionary")
         return super(Function, self).clone(method, substitutions)
 
     @property
     @typemap
     def constants(self):
         '''
-        List of all `Constant` variables of this :class:`Function`
+        List of all `Constant` variables of this :class:`~cntk.ops.functions.Function`
         '''
         return super(Function, self).constants()
 
-    def eval(self, arguments=None, device=None):
+    def eval(self, arguments=None, device=None, as_numpy=True):
         '''
         Evaluate the node using the specified ``arguments`` as input.
 
@@ -161,84 +181,120 @@ class Function(cntk_py.Function):
             arguments: maps variables to their input data. The interpretation depends on
              the input type:
 
-               * `dict`: keys are input variable or names, and values are the input data.
-               * any other type: if node has an unique input, ``arguments`` is mapped to this input.
-                For nodes with more than one input, only `dict` is allowed.
-             In both cases, every every sample in the data will be interpreted
-             as a new sequence. To mark samples as continuations of the
-             previous sequence, specify ``arguments`` as `tuple`: the
-             first element will be used as ``arguments``, and the second one will
-             be used as a list of bools, denoting whether a sequence is a new
-             one (`True`) or a continuation of the previous one (`False`).
+               * dict: keys are input variable or names, and values are the input data.
+                 See :meth:`~cntk.ops.functions.Function.forward` for details on passing
+                 input data.
+               * any other type: if node has an unique input, arguments is
+                 mapped to this input.
+             For nodes with more than one input, only dict is allowed.
+
+             In both cases, every sample in the data will be interpreted
+             as a new sequence.
+
+             Sequences can be marked as continuations of the same sequence in
+             the previous minibatch (that is the sequence in the same slot).
+             There are two possibilities for this:
+
+              * specifying arguments as a `tuple` where the first element is
+                used as arguments and the second one will be used as a list
+                of bools, denoting whether a sequence is a new one (`True`) or a
+                continuation of the sequence in the same slot of the previous
+                minibatch (`False`). This will be applied to all batches.
+              * specifying arguments as a dictionary of variables to tuples
+                where the first element is used as arguments and the second
+                one will be used as a list of bools, denoting whether a sequence
+                is a new one (`True`) or a continuation of the sequence in the
+                same slot of the previous minibatch (`False`). This will be
+                applied to all batches.
+
              Data should be either NumPy arrays or a
-             :class:`cntk.io.MinibatchData` instance.
-            device (:class:`cntk.device.DeviceDescriptor`): the device descriptor that
+             :class:`~cntk.io.MinibatchData` instance.
+            device (:class:`~cntk.device.DeviceDescriptor`): the device descriptor that
              contains the type and id of the device on which the computation is
              to be performed.
+            as_numpy (bool): whether to return the result as a NumPy array. Default True.
+             Specifying this as False returns a CNTK Value which avoids a 
+             costly conversion but returns a somewhat opaque object.
 
         Returns:
-            `bool`: `True` if updates have been performed
+           dict or NumPy Array: Dict with keys of ouput variable names and values of
+           output variable. A single NumPy array if there is only one output value.
         '''
 
-        _, output_map = self.forward(arguments, self.outputs, device=device)
+        _, output_map = self.forward(arguments, self.outputs, device=device, as_numpy=as_numpy)
 
         if len(output_map) > 1:
             return output_map
         else:
             return list(output_map.values())[0]
 
+
     @typemap
-    def forward(self, arguments, outputs, keep_for_backward=None, device=None):
+    def forward(self, arguments, outputs, keep_for_backward=None, device=None, as_numpy=True):
         '''
         Computes the values of speficied variables in ``outputs``, using values
         provided in ``arguments`` that correspond to each input `Variable` of
         the function whose ``is_input`` is `True`.
 
         Example:
-            >>> v = C.input_variable(shape=(1,3))
+            >>> v = C.input_variable(shape=(3,))
             >>> f = C.reciprocal(v)
             >>> _, fv = f.forward({v:[[1, 2, 4]]}, [f.output])
             >>> list(fv.values())[0]
-            array([[[[ 1.  ,  0.5 ,  0.25]]]], dtype=float32)
-
-        Example:
-            >>> v = C.input_variable(shape=(1,3))
-            >>> f = C.reciprocal(v)
-            >>> _, fv = f.forward({v:[[1, 2, 4]]}, [f.output])
-            >>> list(fv.values())[0]
-            array([[[[ 1.  ,  0.5 ,  0.25]]]], dtype=float32)
+            array([[[ 1.  ,  0.5 ,  0.25]]], dtype=float32)
 
         Args:
-            arguments: maps variables to their
-             input data. The interpretation depends on the input type:
+            arguments: maps variables to their input data. The interpretation depends on
+             the input type:
 
-               * `dict`: keys are input variable or names, and values are the input data.
-               * any other type: if node has an unique input, ``arguments`` is mapped to this input.
-                For nodes with more than one input, only `dict` is allowed.
-             In both cases, every every sample in the data will be interpreted
-             as a new sequence. To mark samples as continuations of the
-             previous sequence, specify ``arguments`` as ``tuple``: the
-             first element will be used as ``arguments``, and the second one will
-             be used as a list of bools, denoting whether a sequence is a new
-             one (`True`) or a continuation of the previous one (`False`).
+               * dict: keys are input variable or names, and values are the
+                 input data. To specify a minibatch, provide a list of arrays.
+                 The shape of each array must be compatible with the shape of
+                 the dictionary key.If the array denotes a sequence then the
+                 elements of the sequence are grouped along axis 0.
+               * any other type: if node has an unique input, arguments is
+                 mapped to this input.
+             For nodes with more than one input, only dict is allowed.
+
+             In both cases, every sample in the data will be interpreted
+             as a new sequence.
+
+             Sequences can be marked as continuations of the same sequence in
+             the previous minibatch (that is the sequence in the same slot).
+             There are two possibilities for this:
+
+              * specifying arguments as a `tuple` where the first element is
+                used as arguments and the second one will be used as a list
+                of bools, denoting whether a sequence is a new one (`True`) or a
+                continuation of the sequence in the same slot of the previous
+                minibatch (`False`). This will be applied to all batches.
+              * specifying arguments as a dictionary of variables to tuples
+                where the first element is used as arguments and the second
+                one will be used as a list of bools, denoting whether a sequence
+                is a new one (`True`) or a continuation of the sequence in the
+                same slot of the previous minibatch (`False`). This will be
+                applied to all batches.
+
              Data should be either NumPy arrays or a
-             :class:`cntk.io.MinibatchData` instance.
+             :class:`~cntk.io.MinibatchData` instance.
             outputs (iterable): outputs to fetch values for.
-            keep_for_backward (`set`, default `None`): the subset of the
+            keep_for_backward (set, default `None`): the subset of the
              Function's output variables for which gradients shall be calculated
              in a subsequent backward call. If `None`, the returned state will
              be `None` and a subsequent call to :func:`backward` will not be
              possible.
-            device (:class:`cntk.device.DeviceDescriptor`, default `None`): the device
+            device (:class:`~cntk.device.DeviceDescriptor`, default `None`): the device
              descriptor that contains the type and id of the device on which the
              computation is. If `None`, the default device is used.
+            as_numpy (bool): whether to return the result as a NumPy array. Default True.
+             Specifying this as False returns a CNTK Value which avoids a 
+             costly conversion but returns a somewhat opaque object.
 
         Returns:
-             A tuple (`BackpropState`, `map` of outputs to NumPy arrays). The
-             BackpropState is a handle taken by :func:`backward`.
+             A tuple (BackPropState, map of outputs to NumPy arrays). The
+             BackPropState is a handle taken by :func:`backward`.
         '''
         if device is None:
-            from cntk import DeviceDescriptor
             device = DeviceDescriptor.use_default_device()
 
         in_var_map = sanitize_var_map(self.arguments, arguments,
@@ -248,9 +304,9 @@ class Function(cntk_py.Function):
 
         state = super(Function, self)._forward(in_var_map, output_map, device,
                                              keep_for_backward)
-
-        for k in output_map:
-            output_map[k] = value_to_seq(output_map[k])
+        if as_numpy:
+            for k in output_map:
+                output_map[k] = variable_value_to_seq(output_map[k], k)
 
         return state, output_map
 
@@ -259,41 +315,89 @@ class Function(cntk_py.Function):
         '''
         Backpropagates supplied ``root_gradients`` for one or more of the output
         variables of the Function, to calculate gradients with respect to
-        ``variables``.
+        ``variables``. Formally, multiplies the values of ``root_gradients`` by
+        the Jacobian of the Function and returns the subset of the output that
+        corresponds to ``variables``.
 
         Example:
             >>> # compute the value and the derivative of the sigmoid at 0
-            >>> v = C.input_variable(shape=(1,))
+            >>> v = C.input_variable(shape=(1,), needs_gradient=True)
             >>> f = C.sigmoid(v)
-            >>> df, fv = f.forward({v:[0]}, [f.output], set([f.output]))
+            >>> df, fv = f.forward({v:[[0]]}, [f.output], set([f.output]))
             >>> value = list(fv.values())[0]
-            >>> grad  = f.backward(df, {f.output: np.ones_like(value)}, set([v]))
+            >>> grad = f.backward(df, {f.output: np.ones_like(value)}, set([v]))
             >>> value
             array([[[ 0.5]]], dtype=float32)
             >>> list(grad.values())[0]
             array([[[ 0.25]]], dtype=float32)
 
         Args:
-            state (`BackPropState`): state obtained from a previous call to the
+            state (BackPropState): state obtained from a previous call to the
              func:`cntk.ops.Function.forward` method on this Function for the
              computation that this gradient backpropagation corresponds to.
-            root_gradients (`dict`): the gradients that will be backpropagated
-            variables (`set`): a list of input variables with respect to which
+            root_gradients (dict): the gradients that will be backpropagated
+            variables (set): a list of input variables with respect to which
              the gradients have to be computed.
 
         Returns:
-            `dict`: mapping of ``variables`` to NumPy arrays
+            dict: mapping of ``variables`` to NumPy arrays
         '''
-        root_gradients = sanitize_var_map(self.outputs, root_gradients)
+        device = state.device()
+        root_gradients = sanitize_var_map(self.outputs, root_gradients,
+                                          None, device)
 
         var_gradients = dict((var, None) for var in variables)
 
         self._backward(state, root_gradients, var_gradients)
 
         for var, value in var_gradients.items():
-            var_gradients[var] = value_to_seq(value)
+            var_gradients[var] = variable_value_to_seq(value, var)
 
         return var_gradients
+
+    @typemap
+    def grad(self, at, wrt=None, device=None):
+        '''
+        Computes the gradient of this Function at location ``at`` with respect to ``wrt``.
+        The Function must have a single output.
+
+        Example:
+            >>> x = C.input_variable(shape=(1,), needs_gradient=True)
+            >>> y = C.sqrt(x)
+            >>> a = np.asarray([1,4,16],dtype=np.float32).reshape(3,1,1)
+            >>> y.grad({x:a})
+            [array([[[ 0.5  ]],
+            <BLANKLINE>
+                   [[ 0.25 ]],
+            <BLANKLINE>
+                   [[ 0.125]]], dtype=float32)]
+
+        Args:
+            at (dict) : mapping of the Function's arguments to values
+            wrt (list optional): list of Variables with respect to which the
+             gradient will be computed. If omitted, the gradients with
+             respect to all arguments that need gradient will be computed. If a variable
+             is repeated in this list, the gradient will be repeated
+             in the output as a shallow copy.
+
+        Returns:
+            list: list containing the gradients in the same order as
+            the variables in ``wrt``. Each element has the same shape as
+            ``wrt`` including dynamic axes (such as the minibatch axis).
+        '''
+
+        if len(self.outputs) != 1 :
+            raise InvalidArgumentException('function must return a single tensor')
+
+        if wrt is None:
+            wrt = [arg for arg in self.arguments if arg.needs_gradient]
+
+        unique_wrt = set(wrt)
+        output = [self.output]
+        state, results = self.forward(at, output, set(output), device)
+        ones = {self.output: np.ones_like(v) for v in results.values()}
+        grad_dict = self.backward(state, ones, unique_wrt)
+        return [grad_dict[v] for v in wrt]
 
     @property
     @typemap
@@ -301,7 +405,7 @@ class Function(cntk_py.Function):
         '''
         List of all input variables of this function.
         '''
-        return super(Function, self).inputs()
+        return super(Function, self).inputs(True)
 
     @property
     def name(self):
@@ -310,13 +414,24 @@ class Function(cntk_py.Function):
         '''
         return super(Function, self).name()
 
+    @name.setter
+    def name(self, function_name):
+        '''
+        Sets the name of this Function.
+        Setting the name of a Function is only allowed if the Function does not already have a name.
+        Calling this method, when this Function already has a name, results in an exception.
+
+        Args:
+            function_name (`str`): name for this Function.
+        '''
+        super(Function, self).set_name(function_name)
+
     @property
     def op_name(self):
         '''
         Name of the operation that this Function performs
         '''
         return super(Function, self).op_name()
-
 
     @property
     @typemap
@@ -350,62 +465,6 @@ class Function(cntk_py.Function):
         '''
         return super(Function, self).placeholders()
 
-    @typemap
-    def replace_placeholders(self, substitutions):
-        '''
-        In-place replace specified placeholders in the Function graph with the
-        specified replacements in the map.
-
-        Args:
-            substitutions (``dict``): map from placeholder to variables
-
-        Returns:
-            :class:`Function`: itself
-        '''
-        return super(Function, self).replace_placeholders(substitutions)
-
-    @typemap
-    def replace_placeholder(self, substitution):
-        '''
-        In-place replace the only placeholder in the function graph with the
-        specified substitution.
-
-        Args:
-            substitution (:class:`cntk.ops.variables.Variable`): the variable
-             that will replace the placeholder 
-
-        Returns:
-            :class:`Function`: itself
-
-        :raises ExceptionType: when the function has multiple placeholders.
-        '''
-        return super(Function, self).replace_placeholder(substitution)
-
-    @typemap
-    def save_model(self, filename, use_legacy_format=True):
-        '''
-        Save this function graph into a model file
-
-        Args:
-            filename (`str`): model path
-            use_legacy_format (`str`): if 'True', model is stored using legacy format.
-             Otherwise, it's stored using protobuf-based protocol serialization.
-        '''
-        return super(Function, self).save_model(filename, use_legacy_format)
-
-    @typemap
-    def restore_model(self, filename):
-        '''
-        Restore the models parameters from a saved model file
-
-        Args:
-            filename (`str`): saved model path 
-
-        Returns:
-            `None`: this method only has the side-effect of loading the model parameters from the file
-        '''
-        return super(Function, self).restore_model(filename)
-
     @property
     @typemap
     def root_function(self):
@@ -415,6 +474,52 @@ class Function(cntk_py.Function):
         return super(Function, self).root_function()
 
     @property
+    def is_primitive(self):
+        '''
+        Returns a boolean indicating if this Function is a primitive Function.
+        A primitive Function is the lowest level building block for composite Function
+        graphs and is either a CNTK built-in operator, a composite Function encapsulated
+        as a Block or a user-defined Function
+        '''
+        return super(Function, self).is_primitive()
+
+    @property
+    def is_composite(self):
+        '''
+        Returns a boolean indicating if this Function is a composite Function.
+        A composite Function is a Function that is composed of primitive Functions.
+        '''
+        return super(Function, self).is_composite()
+
+    @property
+    def is_block(self):
+        '''
+        Returns a boolean indicating if this Function is a block function which is basically
+        a composite encapsulated as an opaque block which appears as a primitive during
+        traversing the graph of Functions that this block is part of.
+        '''
+        return super(Function, self).is_block()
+
+    @property
+    @typemap
+    def block_root(self):
+        '''
+        Returns the root of the Function graph underlying this block Function.
+        Throws an exception if this is not a block Function.
+        '''
+        return super(Function, self).block_root()
+
+    @property
+    @typemap
+    def block_arguments_mapping(self):
+        '''
+        Returns the mapping from the arguments of the composite underlying this block function
+        to the Variables that they are bound to in the outer graph of Functions that this
+        block Function is part of.
+        '''
+        return super(Function, self).block_arguments_mapping()
+
+    @property
     @typemap
     def uid(self):
         '''
@@ -422,3 +527,311 @@ class Function(cntk_py.Function):
         '''
         return super(Function, self).uid()
 
+    @typemap
+    def replace_placeholders(self, substitutions):
+        '''
+        In-place replace specified placeholders in the Function graph with the
+        specified replacements in the map.
+
+        Args:
+            substitutions (dict): map from placeholder to variables
+
+        Returns:
+            :class:`Function`: itself
+        '''
+        substitutions = substitutions or {}
+        if not isinstance(substitutions, dict):
+            raise TypeError("Variable substitution map must be a dictionary")
+        return super(Function, self).replace_placeholders(substitutions)
+
+    @typemap
+    def replace_placeholder(self, substitution):
+        '''
+        In-place replace the only placeholder in the function graph with the
+        specified substitution.
+
+        Args:
+            substitution (:class:`~cntk.ops.variables.Variable`): the variable
+             that will replace the placeholder
+
+        Returns:
+            :class:`Function`: itself
+
+        :raises ExceptionType: when the function has multiple placeholders.
+        '''
+        return super(Function, self).replace_placeholder(substitution)
+
+    @typemap
+    def find_all_with_name(self, name):
+        '''
+        Returns a list of primitive function with ``name`` in the graph
+        starting from this node. Throws an exception if ``name`` occurs
+        multiple times. If you expect only one function to be returned, use
+        :func:`find_by_name`.
+
+        Example:
+            >>> a = C.input_variable(shape=1, name='i')
+            >>> b = C.input_variable(shape=1, name='i')
+            >>> c = C.plus(a, b, name='c')
+            >>> len(c.find_all_with_name('i'))
+            2
+            >>> c.find_all_with_name('z')
+            []
+
+        Args:
+            name (str): names to look for
+
+        Returns:
+            list of :class:`Function` objects matching ``name``
+
+        See also:
+            :func:`find_by_name`
+        '''
+        from .. import graph
+        return graph.find_all_with_name(self, name)
+
+    # TODO have a better name for combine() in this case
+    @typemap
+    def find_by_name(self, name):
+        '''
+        Returns a primitive function with ``name`` in the graph starting from
+        this node. Throws an exception if ``name`` occurs multiple times. If
+        you expect multiple functions to be returned, use
+        :func:`find_all_with_name`.
+
+        Example:
+            >>> a = C.input_variable(shape=1, name='a')
+            >>> b = C.input_variable(shape=1, name='b')
+            >>> c = C.plus(a, b, name='c')
+            >>> print(c.find_by_name('b').name)
+            b
+            >>> c.find_by_name('z') is None
+            True
+
+            If you need a full function out of it that can be evaluated, you
+            need to upcast it (currently done via combine):
+
+            >>> d = c * 5
+            >>> C.combine([d.find_by_name('c')]).eval({a:[[1]], b:[[2]]})
+            array([[[ 3.]]], dtype=float32)
+
+        Args:
+            name (str): names to look for
+
+        Returns:
+            :class:`Function` object matching ``name``
+
+        See also:
+            :func:`find_all_with_name`
+        '''
+        from .. import graph
+        return graph.find_by_name(self, name)
+
+    @typemap
+    def save(self, filename):
+        '''
+        Save this function graph into a model file using protobuf-based
+        serialization.
+
+        Args:
+            filename (str): model path
+        '''
+        return super(Function, self).save_model(filename)
+
+    def save_model(self, filename): # legacy name
+        import warnings
+        warnings.warn('This will be removed in future versions. Please use '
+                'save(...) instead', DeprecationWarning)
+        return self.save(filename)
+
+    @typemap
+    def restore(self, filename):
+        '''
+        Restore the models parameters (in-place) from a saved model file
+
+        Args:
+            filename (str): saved model path
+
+        Returns:
+            `None`: this method only has the side-effect of loading the model parameters from the file
+        '''
+        return super(Function, self).restore_model(filename)
+
+    def restore_model(self, filename): # legacy name
+        import warnings
+        warnings.warn('This will be removed in future versions. Please use '
+                'restore(...) instead', DeprecationWarning)
+        return self.restore(filename)
+
+    @staticmethod
+    @typemap
+    def load(filename, device=None):
+        '''
+        Load the model in ``filename``, that has been saved using
+        :func:`~cntk.ops.functions.Function.save`.
+
+        Args:
+            filename (str): filename to load the model from
+            device (:class:`~cntk.device.DeviceDescriptor`, default is the default device):
+             instance of DeviceDescriptor
+
+        Returns:
+            root node
+        '''
+        if not device:
+            device = DeviceDescriptor.use_default_device()
+        return cntk_py.Function.load_model(filename, device)
+
+@typemap
+def load_model(filename, device=None):
+    '''
+    Alias for :func:`~cntk.ops.functions.Function.load`.
+    '''
+    return Function.load(filename, device)
+
+@typemap
+def save_model(model, filename): # legacy name
+    import warnings
+    warnings.warn('This will be removed in future versions. Please use '
+            'model.save(...) instead', DeprecationWarning)
+    return model.save(filename)
+
+
+class UserFunction(Function):
+    '''
+    Base class of all user extension functions.
+
+    If it has only one output, one can invoke Variable methods on it, which it
+    will relay to its only output.
+
+    '''
+    def __init__(self, inputs, name=''):
+        super(UserFunction, self).__init__(inputs, name)
+
+        # Memory management for user defined functions has to be controlled by
+        # the C++ side. For more information:
+        # http://www.swig.org/Doc3.0/Python.html#Python_nn35
+        self.__disown__()
+
+
+    def _forward(self, arguments, outputs, device=None, outputs_to_retain=None):
+        '''
+        Computes the values of speficied variables in ``outputs``, using values
+        provided in ``arguments`` that correspond to each input `Variable` of
+        the function whose ``is_input`` is `True`.
+
+        This function calls :func:`forward`, which is to be implemented by the
+        user.
+
+        Args:
+            arguments (tuple): Value objects of the Function's input
+            outputs (iterable): outputs to fetch values for.
+            device (:class:`~cntk.device.DeviceDescriptor`, default `None`): the device
+             descriptor that contains the type and id of the device on which the
+             computation is. If `None`, the default device is used.
+
+        Returns:
+             A BackPropState instance, which is used by :func:`backward`.
+        '''
+        arguments = tuple(variable_value_to_seq(v, self.inputs[i]) for i, v in enumerate(arguments))
+
+        map_if_possible(outputs)
+        map_if_possible(outputs_to_retain)
+
+        args = arguments if len(arguments)>1 else arguments[0]
+
+        if len(outputs) <= 1:
+            state, result = self.forward(args, device, outputs_to_retain)
+            for k in outputs:
+                outputs[k] = result
+        else:
+            state = self.forward(args, outputs, device, outputs_to_retain)
+
+        if not isinstance(state, cntk_py.BackPropState):
+            state = cntk_py.UserBackPropState(self, device, state)
+
+        for k,v in outputs.items():
+            if v is None:
+                raise ValueError('not all outputs have been provided')
+
+            # FIXME: seq_starts
+            outputs[k] = sanitize_batch(k, v, None, device)
+
+        return state, outputs
+
+    def _backward(self, state, root_gradients, variables):
+        '''
+        Backpropagates supplied ``root_gradients`` for one or more of the output
+        variables of the Function, to calculate gradients with respect to
+        ``variables``. Formally, multiplies the values of ``root_gradients`` by
+        the Jacobian of the Function and returns the subset of the output that
+        corresponds to ``variables``.
+
+        This function calls :func:`backward`, which is to be implemented by the
+        user.
+
+        Example:
+            TBD
+
+        Args:
+            state (BackPropState): state obtained from a previous call to the
+             func:`cntk.ops.Function.forward` method on this Function for the
+             computation that this gradient backpropagation corresponds to.
+            root_gradients (dict): the gradients that will be backpropagated
+            variables (set): a list of input variables with respect to which
+             the gradients have to be computed.
+
+        Returns:
+            dict: mapping of ``variables`` to NumPy arrays
+        '''
+        for v in root_gradients:
+            root_gradients[v] = variable_value_to_seq(root_gradients[v], v)
+        map_if_possible(variables)
+
+
+        if len(variables)>1:
+            self.backward(cntk_py.UserBackPropState.data(state), root_gradients, variables)
+        else:
+            for rg in root_gradients.values():
+                break
+            result = self.backward(cntk_py.UserBackPropState.data(state), rg)
+            for k in variables:
+                variables[k] = result
+
+        for k,v in variables.items():
+            if v is None:
+                raise ValueError('gradients were not provided for all variables')
+
+            variables[k] = sanitize_batch(k, v, None, state.device())
+
+    def _infer_outputs(self, outputs):
+        outputs.extend(self.infer_outputs())
+
+    def infer_outputs(self):
+        '''
+        Returns a list of all output variables this user-defined function
+        outputs.
+
+        Output variables are created by
+        :meth:`~cntk.ops.functions.output_variable`.
+        '''
+        raise NotImplementedError('infer_outputs has to be overwritten')
+
+    def clone(self, cloned_inputs):
+        '''
+        Creates a clone of this user-defined function.
+
+        Args:
+            cloned_inputs: list of cloned inputs to the new user-defined
+             Function clone to be created.
+
+        Returns:
+            A cloned instance of this user-defined function.
+        '''
+        raise NotImplementedError('clone has to be overwritten')
+
+    def op_name(self):
+        '''
+        Returns the operator name.
+        '''
+        return 'UserFunction'

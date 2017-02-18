@@ -1,131 +1,191 @@
-# Copyright (c) Microsoft. All rights reserved.
+﻿# Copyright (c) Microsoft. All rights reserved.
 # Licensed under the MIT license. See LICENSE.md file in the project root
 # for full license information.
 # ==============================================================================
 
 from . import cntk_py
 from . import trainer
+from .utils import typemap
+
+# Preload libmpi.so.12 for non-Windows platform to work around MPI_Init failure bug
+# https://xrunhprof.wordpress.com/2014/11/04/an-openmpi-python-and-dlopen-issue/
+# If other OS has similar OpenMPI MPI_Init failure, add dll load to global here
+import platform
+import ctypes
+if platform.system() == 'Linux':
+    ctypes.CDLL("libmpi.so.12", mode=ctypes.RTLD_GLOBAL)
 
 __doc__= '''\
-Distributed trainers manages trainers in distributed environment.
+Distributed learners manage learners in distributed environment.
 '''
 
-class worker_descriptor:
+class WorkerDescriptor(cntk_py.DistributedWorkerDescriptor):
     '''
-    Distributed worker descriptor, returned by :class:`cntk.distributed.communicator` instance.
+    Distributed worker descriptor, returned by :class:`Communicator` instance.
+    '''
 
-    Args:
-       descriptor (:class:`cntk.cntk_py.DistributedWorkerDescriptor`): internal distributed worker descriptor
-    '''
-    def __init__(self, descriptor):
-        self.data = descriptor
-        return
-    
     @property
     def global_rank(self):
         '''
-        Returns the global rank of the worker.
-
-        Returns:
-            `int`: the global rank of the worker.
+        The global rank of the worker.
         '''
-        return self.data.m_global_rank
+        return super(WorkerDescriptor, self).m_global_rank
 
     @property
     def host_id(self):
         '''
-        Returns the host id of the worker.
-
-        Returns:
-            `str`: the host id of the worker.
+        The host id of the worker.
         '''
-        return self.data.m_host_id
+        return super(WorkerDescriptor, self).m_host_id
 
-class communicator:
+class Communicator(cntk_py.DistributedCommunicator):
     '''
     A communicator interface exposing communication primitives that serve as building blocks 
     for distributed training.
     '''
-    def __init__(self, distributed_communicator):
-        self.data = distributed_communicator
-        return
-    
+
+    @typemap
     def workers(self):
         '''
         Returns workers in this communicator.
         
         Returns:
-            (`list`) of :class:`cntk.distributed.worker_descriptor`: workers in this communicator.
+            (`list`) of :class:`WorkerDescriptor`: workers in this communicator.
         '''
-        raw_list = self.data.workers()
-        ret = []
-        for w in raw_list:
-            ret.append(worker_descriptor(w))
-        return ret
+        return super(Communicator, self).workers()
 
+    @typemap
     def current_worker(self):
         '''
         Returns worker descriptor of current process.
         
         Returns:
-            :class:`cntk.distributed.worker_descriptor`: descriptor of current process.
+            :class:`WorkerDescriptor`: descriptor of current process.
         '''
-        raw = self.data.current_worker()
-        return worker_descriptor(raw)
+        return super(Communicator, self).current_worker()
 
     def barrier(self):
         '''
-        sync point to make sure all workers reach the same state
+        Sync point to make sure all workers reach the same state.
         '''
-        self.data.barrier()
-        return
-        
+        super(Communicator, self).barrier()
+
+    def is_main(self):
+        '''
+        Indicates if the current communicator is instantiated on the main node. The node with rank 0 is considered the main.
+        '''
+        return super(Communicator, self).current_worker().is_main()
+
     @staticmethod
     def finalize():
-        cntk_py.DistributedCommunicator.finalize();
-        return
+        '''
+        Should be called when all communication is finished. No more communication should happen after this call.
+        '''
+        cntk_py.DistributedCommunicator.finalize()
 
-class distributed_trainer:
-    '''
-    A distributed trainer that can be passed to the :class:`cntk.trainer.Trainer`
+    @staticmethod
+    def num_workers():
+        '''
+        Returns information about all MPI workers.
+        '''
+        return cntk_py.number_of_workers()
 
-    Args:
-       trainer (:class:`cntk.cntk_py.DistributedTrainer`): internal distributed trainer
+    @staticmethod
+    def rank():
+        '''
+        Returns rank of current process.
+        '''
+        return cntk_py.worker_global_rank()
+
+class DistributedLearner(cntk_py.DistributedLearner):
     '''
-    def __init__(self, distributed_trainer):
-        self.data = distributed_trainer
+    A distributed learner that handles data like gradients/momentums across multiple MPI workers
+    '''
+    
+    @typemap
+    def communicator(self):
+        '''
+        Returns the distributed communicator that talks to other MPI workers
         
-def mpi_communicator():
-    '''
-    Creates a mpi communicator
+        Returns:
+            :class:`Communicator`: descriptor of current process.
+        '''
+        return super(DistributedLearner, self).get_communicator()
 
-    Returns:
-        :class:`cntk.cntk_py.DistributedCommunicator`: a distributed communicator
+@typemap
+def data_parallel_distributed_learner(learner, distributed_after=0, num_quantization_bits=32, use_async_buffered_parameter_update=False):
     '''
-    return cntk_py.mpicommunicator()
-
-def quantized_mpi_communicator(num_quantization_bits):
-    '''
-    Creates a quantized mpi communicator
+    Creates a data parallel distributed learner
 
     Args:
-        num_quantization_bits (`int`): num_quantization_bits
-
+        learner: a local learner (i.e. sgd)
+        distributed_after (int): number of samples after which distributed training starts
+        num_quantization_bits (int): number of bits for quantization (1 to 32)
+        use_async_buffered_parameter_update (bool): use async buffered parameter update
     Returns:
-        :class:`cntk.cntk_py.QuantizedDistributedCommunicator`: a quantized distributed communicator
+        a distributed learner instance
     '''
-    return cntk_py.quantized_mpicommunicator(True, True, num_quantization_bits)
+    if (num_quantization_bits < 32):
+        return cntk_py.create_quantized_data_parallel_distributed_learner(
+            cntk_py.quantized_mpicommunicator(True, True, num_quantization_bits),
+            learner,
+            distributed_after,
+            use_async_buffered_parameter_update)
+    else:
+        return cntk_py.create_data_parallel_distributed_learner(
+            cntk_py.mpicommunicator(),
+            learner,
+            distributed_after,
+            use_async_buffered_parameter_update)
 
-def data_parallel_distributed_trainer(communicator, use_async_buffered_parameter_update):
+@typemap
+def block_momentum_distributed_learner(learner, block_size, block_momentum_as_time_constant=None, use_nestrov_momentum=True, reset_sgd_momentum_after_aggregation=True, block_learning_rate=1.0, distributed_after=0):
     '''
-    Creates a data parallel distributed trainer using `communicator` with
-    option `use_async_buffered_parameter_update`.
+    Creates a block momentum distributed learner. See [1] for more
+    information.
+
+    Block Momentum divides the full dataset into M non-overlapping blocks,
+    and each block is partitioned into N non-overlapping splits.
+
+    During training, a random, unprocessed block is randomly taken by the trainer
+    and the N partitions of this block are dispatched on the workers.
 
     Args:
-        communicator (:class:`cntk.distributed.communicator`): distributed communicator
-        use_async_buffered_parameter_update (`bool`): use async buffered parameter update
+        learner: a local learner (i.e. sgd)
+        block_size (int): size of the partition in samples
+        block_momentum_as_time_constant (float): block momentum as time constant
+        use_nestrov_momentum (bool): use nestrov momentum
+        reset_sgd_momentum_after_aggregation (bool): reset SGD momentum after aggregation
+        block_learning_rate (float): block learning rate
+        distributed_after (int): number of samples after which distributed training starts
 
     Returns:
-        :class:`cntk.distributed.trainer`: a distributed trainer instance
+        a distributed learner instance
+
+    See also:
+        [1] K. Chen and Q. Huo. `Scalable training of deep learning machines
+        by incremental block training with intra-block parallel optimization
+        and blockwise model-update filtering
+        <https://www.microsoft.com/en-us/research/wp-content/uploads/2016/08/0005880.pdf>`_. 
+        Proceedings of ICASSP, 2016. 
     '''
-    return distributed_trainer(cntk_py.create_data_parallel_distributed_trainer(communicator.data, use_async_buffered_parameter_update))
+    if block_momentum_as_time_constant == None:
+        return cntk_py.create_block_momentum_distributed_learner(
+            cntk_py.mpicommunicator(),
+            learner,
+            distributed_after,
+            block_size,
+            use_nestrov_momentum,
+            reset_sgd_momentum_after_aggregation,
+            block_learning_rate)
+    else:
+        return cntk_py.create_block_momentum_distributed_learner(
+            cntk_py.mpicommunicator(),
+            learner,
+            distributed_after,
+            block_size,
+            block_momentum_as_time_constant,
+            use_nestrov_momentum,
+            reset_sgd_momentum_after_aggregation,
+            block_learning_rate)
+

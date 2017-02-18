@@ -12,6 +12,7 @@
 #include "TensorShape.h"
 #include "MatrixPool.h"
 #include "ComputationEnvironment.h"
+#include "Globals.h"
 
 #include <unordered_set>
 #include <map>
@@ -44,9 +45,12 @@
 #define CNTK_MODEL_VERSION_13 13 // batch norm: switch running inverse std deviation -> variance, MB count -> samplesSeen; CuDNN v5
 #define CNTK_MODEL_VERSION_14 14 // axis parameter in OptimizedRNNStackNode
 #define CNTK_MODEL_VERSION_15 15 // add new nodes: LambdaRankNode and NDCG1Eval
-#define CURRENT_CNTK_MODEL_VERSION CNTK_MODEL_VERSION_15
+#define CNTK_MODEL_VERSION_16 16 // save/load rng state for Dropout and RandomSample nodes.
+#define CNTK_MODEL_VERSION_17 17 // use 8 bytes for rng seeds on both platforms
+#define CNTK_MODEL_VERSION_18 18 // reserving 18 for dilated convolution, write out one more TensorShape 
+#define CNTK_MODEL_VERSION_19 19 // batch norm: add an input parameter to store running mean sample count.
+#define CURRENT_CNTK_MODEL_VERSION CNTK_MODEL_VERSION_19
 
-extern bool g_shareNodeValueMatrices;
 
 // helper mode for debugging
 // If TRACK_GAP_NANS is defined then initialize layout gaps to NaN and do NaN checks. Also do detailed logging of node computations.
@@ -152,7 +156,7 @@ struct ComputationNetworkOwnedNodeState
     friend class ComputationNetwork;
 
     ComputationNetworkOwnedNodeState()
-        : m_needsGradient(false), m_valueSharable(true)
+        : m_needsGradient(false), m_valueSharable(true), m_parentOverwritesGradient(false)
     {
         PurgeStateForFormingRecurrentLoops();
         m_isPartOfLoop = false;
@@ -168,9 +172,13 @@ struct ComputationNetworkOwnedNodeState
         other.m_traceNodeValueSparse          = m_traceNodeValueSparse;
         other.m_traceNodeValueUpToDim         = m_traceNodeValueUpToDim;
         other.m_traceNodeValueUpToT           = m_traceNodeValueUpToT;
+        other.m_parentOverwritesGradient = m_parentOverwritesGradient;
     }
 
     bool IsPartOfLoop() const { return m_isPartOfLoop; }
+
+    void MarkParentOverwritesGradient() { m_parentOverwritesGradient = true; }
+    bool ParentOverwritesGradient() const { return m_parentOverwritesGradient; }
 
     virtual void MarkValueNonSharable() { m_valueSharable = false; }
     virtual void MarkValueSharable() { m_valueSharable = true; }
@@ -186,12 +194,17 @@ struct ComputationNetworkOwnedNodeState
     size_t m_traceNodeValueUpToT = 8;   // 8 time steps fit comfortably into a normal-sized console
     void EnableNodeTracing(bool asReal, bool asCategoryLabel, bool asSparse) { m_traceNodeValueReal = asReal; m_traceNodeValueAsCategoryLabel = asCategoryLabel; m_traceNodeValueSparse = asSparse; }
 
+    virtual bool ImplementsGradientOverwriteOptimization() const { return false; }
+
 protected:                // TODO: should be fully encapsulated here
     bool m_needsGradient; // true if this node or any children need a gradient to be computed (for own consumption or propagation to somewhere in the child tree)
 
     bool m_valueSharable; // a flag is needed for memory share.
                           // If it is false (e.g., LearnableParameters/InputValue and those nodes are solely induced by LearnableParameters),
                           // it will never be released to memory pool
+
+    bool m_parentOverwritesGradient; // flag indicating whether the parent of this node overwrites the gradient of this node instead of accumulating to it
+
 private:
     bool m_isPartOfLoop; // true if this loop is part of a recurrent loop
 
@@ -241,7 +254,7 @@ public:
     {
         m_evalTimeStamp = 0;
     }
-    int64_t GetEvalTimeStamp() const
+    uint64_t GetEvalTimeStamp() const
     {
         return m_evalTimeStamp;
     }
@@ -254,18 +267,17 @@ public:
 
     bool IsOlderThan(const TimeStamp& other) const
     {
-        // the difference is taken to take into account numeric overflow (which really should never happen for a 64-bit integer... but hey, it's free!)
-        return GetEvalTimeStamp() - other.GetEvalTimeStamp() < 0;
+        return GetEvalTimeStamp() < other.GetEvalTimeStamp();
     }
 
-    int64_t CreateUniqId() const
+    uint64_t CreateUniqId() const
     {
-        return atomic_fetch_add(&s_timeStampCounter, (unsigned long long int) 1);
+        return ++s_timeStampCounter;
     }
 
 private:
     static atomic_ullong s_timeStampCounter;
-    int64_t m_evalTimeStamp; // this is used to reduce unnecessary recomputation when a different node in the model is reevaluated
+    uint64_t m_evalTimeStamp; // this is used to reduce unnecessary recomputation when a different node in the model is reevaluated
 };
 
 // =======================================================================
@@ -322,6 +334,15 @@ public:
             ComputationNetworkOwnedNodeState::CopyTo(*node);
             TimeStamp::CopyTo(*node);
         }
+
+        if (flags & CopyNodeFlags::copyNodeAll)
+        {
+            for (auto tag : this->GetTags())
+            {
+                node->SetTag(tag);
+            }
+        }
+
         node->ClearConfigMemberCache();
     }
 
@@ -356,7 +377,7 @@ public:
             RpcStringFreeW((RPC_WSTR*) &szUuid);
         }
 #else
-        int64_t id = CreateUniqId();
+        uint64_t id = CreateUniqId();
         std::wstring base = L"AutoName";
         std::wstringstream sstm;
         sstm << base.c_str() << id;
@@ -692,6 +713,8 @@ protected:
 
 public:
 
+    virtual void OnEpochStart() {}
+
     // -----------------------------------------------------------------------
     // forward prop, backprop
     // -----------------------------------------------------------------------
@@ -766,7 +789,11 @@ public:
     virtual bool InputUsedInComputingInputNodesGradients(size_t /*childIndex*/) const { return true; }
 
     void SetOutputNeededDuringBackprop(bool f) { m_outputNeededDuringBackprop = f; }
-    bool IsOutputNeededDuringBackprop() const { return !g_shareNodeValueMatrices || m_outputNeededDuringBackprop; }
+    bool IsOutputNeededDuringBackprop() const 
+    { 
+        return (!Globals::ShouldEnableShareNodeValueMatrices() && !Globals::ShouldEnableHyperCompressMemory())
+            || m_outputNeededDuringBackprop; 
+    }
 
     // -----------------------------------------------------------------------
     // helpers for network traversal
@@ -1213,17 +1240,17 @@ public:
     // creation from configuration
     // Nodes with NumInputs<> should say DeclareConstructorFromConfigWithNumInputs(ClassName), and nodes without DeclareConstructorFromConfig(ClassName).
     // The macro will forward to the regular constructor of the node (which may do more than just calling the base constructor), and then attach the inputs from config.
-#define DeclareConstructorFromConfigWithNumInputs(C)                   \
-    C(const ScriptableObjects::IConfigRecordPtr configp)               \
-        : C(configp->Get(L"deviceId"), L"<placeholder>")               \
-    {                                                                  \
-        AttachInputsFromConfig(configp, this->GetExpectedNumInputs()); \
+#define DeclareConstructorFromConfigWithNumInputs(C)                     \
+    C(const Microsoft::MSR::ScriptableObjects::IConfigRecordPtr configp) \
+        : C(configp->Get(L"deviceId"), L"<placeholder>")                 \
+    {                                                                    \
+        AttachInputsFromConfig(configp, this->GetExpectedNumInputs());   \
     }
-#define DeclareConstructorFromConfig(C)                            \
-    C(const ScriptableObjects::IConfigRecordPtr configp)           \
-        : C(configp->Get(L"deviceId"), L"<placeholder>")           \
-    {                                                              \
-        AttachInputsFromConfig(configp);                           \
+#define DeclareConstructorFromConfig(C)                                  \
+    C(const Microsoft::MSR::ScriptableObjects::IConfigRecordPtr configp) \
+        : C(configp->Get(L"deviceId"), L"<placeholder>")                 \
+    {                                                                    \
+        AttachInputsFromConfig(configp);                                 \
     }
 
     // helper to load m_value from a stream
@@ -1296,9 +1323,9 @@ protected:
                 auto* val = configp->Find(L"inputs");
                 if (!val) // if there is no 'inputs' then get the first item of this config record for a Fail() function
                 {
-                    auto members = configp->GetMemberIds();
-                    if (members.size() > 0)
-                        val = configp->Find(members.front());
+                    auto members2 = configp->GetMemberIds();
+                    if (members2.size() > 0)
+                        val = configp->Find(members2.front());
                 }
                 if (val)
                     val->Fail(msra::strfun::wstrprintf(L"Expected %d inputs, but %d were given.", (int) expectedNumInputs, (int) inputs.size()));
@@ -1397,6 +1424,30 @@ public:
         MaskMissingColumnsTo(*m_gradient, m_pMBLayout, fr, Matrix<ElemType>::MakeNan(__LINE__));
     }
 
+    static TensorView<ElemType> Unpack(const TensorShape& sampleShape,
+                                       const Matrix<ElemType>& packedData,                                       
+                                       const MBLayoutPtr& layout,
+                                       const std::shared_ptr<Matrix<ElemType>>& unpackedDataStorage,
+                                       const std::shared_ptr<Matrix<ElemType>>& tempIndicesStorage,
+                                       bool batchMajor,
+                                       bool maskGaps);
+
+    static TensorView<ElemType> Unpack(const TensorShape& sampleShape,
+                                       const Matrix<ElemType>& packedData,
+                                       const MBLayoutPtr& layout,
+                                       bool batchMajor,
+                                       bool maskGaps)
+    {
+        auto nullSharedPtr = std::shared_ptr<Matrix<ElemType>>(nullptr);
+        return Unpack(sampleShape, packedData, layout, nullSharedPtr, nullSharedPtr, batchMajor, maskGaps);
+    }
+
+    static void BroadcastToPacked(const Matrix<ElemType>& dataToBroadcast,
+                                  const MBLayoutPtr& inputLayout,
+                                  Matrix<ElemType>& broadcastTo,
+                                  const FrameRange& targetFrameRange,
+                                  const std::shared_ptr<Matrix<ElemType>>& tempIndicesStorage);
+
     // -----------------------------------------------------------------------
     // accessors for value and gradient
     // -----------------------------------------------------------------------
@@ -1405,12 +1456,15 @@ public:
     Matrix<ElemType>&       Value()       { return *m_value; }
 
     MatrixBasePtr ValuePtr() const override final { return m_value; }    // readers want this as a shared_ptr straight
+    std::shared_ptr<Matrix<ElemType>>& ValuePtrRef() { return m_value; }
+
     // Note: We cannot return a const& since returning m_value as a MatrixBasePtr is a type cast that generates a temporary. Interesting.
 
     const Matrix<ElemType>& Gradient() const { return *m_gradient; }
     Matrix<ElemType>&       Gradient()       { return *m_gradient; }
 
     MatrixBasePtr GradientPtr() const { return m_gradient; }
+    std::shared_ptr<Matrix<ElemType>>& GradientPtrRef() { return m_gradient; }
     // TODO: This is only used for testing whether a gradient has been allocated. Maybe reduce to bool HasGradient()?
 
 private:
@@ -1569,8 +1623,8 @@ protected:
         DetermineDataSize(rows, cols);
         try
         {
-        m.VerifySize(rows, cols);
-    }
+            m.VerifySize(rows, cols);
+        }
         catch (const std::exception& e)
         {
             Rethrow(e);
@@ -1626,18 +1680,57 @@ public:
 #endif
         // tracing
         Trace();
+
+        // Any memory not needed could resize to zero immediately when HyperCompressMemory active. Since the memory won't really release,
+        // all these memory blocks are gathered into a memory pool. When the next request coming, the best fitting block will be chosen.
+        if (Globals::ShouldEnableHyperCompressMemory()) 
+        {
+            for (auto& input : GetInputs())
+            {
+                if (!input->IsOutputNeededDuringBackprop() && input->IsValueSharable())
+                {
+                    auto inputNodePtr = DownCast(input);
+                    inputNodePtr->Value().Resize(0, 0);
+                }
+            }
+        }
     }
 
-#if 0   // (keep it around in case we need to add stuff in the future)
-        virtual void /*IComputationNode::*/BeginBackprop() override
-        {
-            Base::BeginBackprop();
-        }
-#endif
+    virtual void /*IComputationNode::*/BeginBackprop() override
+    {
+        Base::BeginBackprop();
 
-#ifdef _DEBUG
+        if (NeedsGradient())
+        {
+            // Verify that the shapes of the output/input Value matrices that the gradient backprop for this node needs
+            // are intact and have not been erroneously reshaped due to incorrect memory sharing
+            auto VerifyValueShape = [](const ComputationNode<ElemType>& node) {
+                size_t rows, cols;
+                node.DetermineDataSize(rows, cols);
+
+                auto& valueMatrix = node.Value();
+                if ((valueMatrix.GetNumRows() != rows) || (valueMatrix.GetNumCols() != cols))
+                {
+                    LogicError("%ls %ls operation found to have incorrect Value() matrix shape %lu x %lu during backprop; expected shape is %lu x %lu. "
+                               "This may be due to incorrect memory sharing.",
+                               node.NodeName().c_str(), node.OperationName().c_str(), valueMatrix.GetNumRows(), valueMatrix.GetNumCols(), rows, cols);
+                }
+            };
+
+            if (IsOutputNeededDuringBackprop())
+                VerifyValueShape(*this);
+
+            for (size_t i = 0; i < m_inputs.size(); i++)
+            {
+                if (InputUsedInComputingInputNodesGradients(i))
+                    VerifyValueShape(InputRef(i));
+            }
+        }
+    }
+
     virtual void /*IComputationNode::*/ EndBackprop() override
     {
+#ifdef _DEBUG
         Base::EndBackprop();
 #ifdef TRACK_GAP_NANS
         for (size_t i = 0; i < m_inputs.size(); i++)
@@ -1651,8 +1744,18 @@ public:
             }
         }
 #endif
-    }
 #endif
+        // We could release the gradient of value sharable nodes and all no-longer used memory generated in forward.
+        if (IsValueSharable() && Globals::ShouldEnableHyperCompressMemory())
+        {
+            if (GradientPtr()) 
+                Gradient().Resize(0, 0);
+
+            // canceling the graph dependency
+            if (IsOutputNeededDuringBackprop()) 
+                Value().Resize(0, 0);
+        }
+    }
 
     // this is the entry point from Network; while it will call virtual BackpropTo() into the actual node implementation
     // TODO: move to -Base (or -Network?)
@@ -1675,7 +1778,10 @@ public:
     void ResetGradient(ElemType val)
     {
         UpdateDataSize(Gradient());
-        Gradient().SetValue(val);
+
+        // No need to zero initialize the gradient if the node's parent is going to overwrite it anyways
+        if ((val != 0) || !ParentOverwritesGradient())
+            Gradient().SetValue(val);
 
         m_gradientInitialized = true;
     }
@@ -1809,7 +1915,7 @@ public:
                                       const std::vector<std::string>& labelMapping, const std::string& sequenceSeparator, 
                                       const std::string& sequencePrologue, const std::string& sequenceEpilogue, const std::string& elementSeparator,
                                       const std::string& sampleSeparator, std::string valueFormatString,
-                                      bool outputGradient = false) const;
+                                      bool outputGradient = false, bool onlyShowAbsSumForDense = false) const;
 
     // simple helper to log the content of a minibatch
     void DebugLogMinibatch(bool outputGradient = false) const
@@ -2348,7 +2454,7 @@ public:
 // -----------------------------------------------------------------------
 
 template <class ElemType>
-class BinaryElementWiseNode : public ComputationNode<ElemType>, public NumInputs<2>
+class BinaryElementWiseNode : public ComputationNode<ElemType>, public NumInputs<2>, public IdentityTransformerNode
 {
     typedef ComputationNode<ElemType> Base;
     UsingComputationNodeMembers;
